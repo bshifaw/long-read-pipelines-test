@@ -5,7 +5,7 @@ import "../Structs.wdl"
 task GetReadGroupInfo {
     meta {
         desciption:
-        "Get some read group information Given a single-readgroup BAM. Will fail if the information isn't present."
+        "Get some read group information given a single-readgroup BAM. If the requested keys are absent, a null value is assigned in the returned entry. If the BAM contains multiple read groups, results are undetermined."
     }
 
     input {
@@ -23,7 +23,11 @@ task GetReadGroupInfo {
         set -eux
 
         export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
-        samtools view -H ~{uBAM} | grep "^@RG" | tr '\t' '\n' > rh_header.txt
+        samtools view -H ~{uBAM} | grep "^@RG" > one_rg_per_line.txt
+        num_rgs=$(wc -l one_rg_per_line.txt | awk '{pritn $1}')
+        if [[ num_rgs -gt 1 ]]; then exit 1; fi
+
+        cat one_rg_per_line.txt | tr '\t' '\n' > rh_header.txt
 
         for attribute in ~{sep=' ' keys}; do
             if grep -q "^${attribute}" rh_header.txt; then
@@ -61,6 +65,7 @@ task SplitByRG {
 
         Int? num_ssds
 
+        Boolean retain_rgless_records = false
         Boolean sort_and_index = false
         RuntimeAttr? runtime_attr_override
     }
@@ -76,6 +81,7 @@ task SplitByRG {
 
     Int disk_size = if defined(num_ssds) then 375*select_first([num_ssds]) else 1+3*ceil(size([bam], "GB"))
 
+    Array[String] extra_args = if (retain_rgless_records) then ["-u", "~{out_prefix}_noRG.bam"] else [""]
     command <<<
         set -eux
 
@@ -83,8 +89,8 @@ task SplitByRG {
         cat "read_groups_header.txt" | tr '\t' '\n' | grep "^ID:"  | awk -F ':' '{print $2}' > "RG_ids.txt"
 
         samtools split -@3 \
-            -u "~{out_prefix}_noRG.bam" \
             -f "~{out_prefix}_%#.bam" \
+            ~{sep=" " extra_args} \
             ~{bam}
         if ~{sort_and_index} ;
         then
@@ -256,5 +262,112 @@ task UnAlignBam {
         preemptible:            select_first([runtime_attr.preemptible_tries, default_attr.preemptible_tries])
         maxRetries:             select_first([runtime_attr.max_retries,       default_attr.max_retries])
         docker:                 select_first([runtime_attr.docker,            default_attr.docker])
+    }
+}
+
+task ValidateSamFile {
+    meta {
+        desciption: "Call GATK/Picard ValidateSamFile to validate input BAM: https://bit.ly/3JMutxp."
+    }
+    parameter_meta {
+        validation_mode: "Desired valiation mode"
+        disk_type: "Type of disk to use for the computation."
+    }
+
+    input {
+        File bam
+        String validation_mode = "SUMMARY"
+
+        Array[String] validation_errs_to_ignore = ["INVALID_TAG_NM",  # for the purpose we currently have, NM and CIGAR don't matter, and longreads have no mates
+                                                    "MISSING_TAG_NM",
+                                                    "INVALID_CIGAR",
+                                                    "ADJACENT_INDEL_IN_CIGAR",
+                                                    "CIGAR_MAPS_OFF_REFERENCE",
+                                                    "MISMATCH_MATE_CIGAR_STRING",
+                                                    "MATE_CIGAR_STRING_INVALID_PRESENCE",
+                                                    "MATE_NOT_FOUND",
+                                                    "INVALID_MAPPING_QUALITY",
+                                                    "INVALID_FLAG_MATE_UNMAPPED",
+                                                    "MISMATCH_FLAG_MATE_UNMAPPED",
+                                                    "INVALID_FLAG_MATE_NEG_STRAND",
+                                                    "MISMATCH_FLAG_MATE_NEG_STRAND",
+                                                    "INVALID_MATE_REF_INDEX",
+                                                    "MISMATCH_MATE_REF_INDEX",
+                                                    "MISMATCH_MATE_ALIGNMENT_START",
+                                                    "MATE_FIELD_MISMATCH",
+                                                    "PAIRED_READ_NOT_MARKED_AS_FIRST_OR_SECOND"
+                                                   ]
+
+        String disk_type = "LOCAL"
+
+        RuntimeAttr? runtime_attr_override
+    }
+
+    Int disk_size = ceil(size(bam, "GiB")) + 50
+    String output_basename = basename(basename(bam, ".bam"), ".cram")
+    String output_name = "${output_basename}_${validation_mode}.txt"
+
+    command <<<
+        set -eux
+
+        gatk ValidateSamFile \
+            --INPUT ~{bam} \
+            --OUTPUT ~{output_name} \
+            --MODE ~{validation_mode} \
+            ~{true="--IGNORE " false="" 0<length(validation_errs_to_ignore)} \
+            ~{sep=" --IGNORE " validation_errs_to_ignore}
+
+    >>>
+
+    output {
+        File validation_report = "${output_name}"
+    }
+
+    #########################
+    RuntimeAttr default_attr = object {
+        cpu_cores:          2,
+        mem_gb:             8,
+        disk_gb:            disk_size,
+        preemptible_tries:  2,
+        max_retries:        1,
+        docker:             "us.gcr.io/broad-gatk/gatk:4.4.0.0"
+    }
+    RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
+    runtime {
+        cpu:                    select_first([runtime_attr.cpu_cores,         default_attr.cpu_cores])
+        memory:                 select_first([runtime_attr.mem_gb,            default_attr.mem_gb]) + " GiB"
+        disks: "local-disk " +  select_first([runtime_attr.disk_gb,           default_attr.disk_gb]) + " ~{disk_type}"
+        preemptible:            select_first([runtime_attr.preemptible_tries, default_attr.preemptible_tries])
+        maxRetries:             select_first([runtime_attr.max_retries,       default_attr.max_retries])
+        docker:                 select_first([runtime_attr.docker,            default_attr.docker])
+    }
+}
+
+task CountReadGroups {
+    meta {
+        desciption: "Count the number of RG lines in the header of the BAM file."
+    }
+    input {
+        String bam  # not using file as call-caching brings not much benefit
+    }
+
+    command <<<
+        set -eux
+
+        export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
+        samtools view -H ~{bam} | grep -c "^@RG" > "rg_cnt.txt"
+    >>>
+
+    output {
+        Int num_rg = read_int("rg_cnt.txt")
+    }
+    runtime {
+        cpu:            1
+        memory:         "4 GiB"
+        disks:          "local-disk 100 HDD"
+        bootDiskSizeGb: 10
+        preemptible:    2
+        maxRetries:     1
+        docker: "us.gcr.io/broad-dsp-lrma/lr-basic:0.1.1"
     }
 }

@@ -39,13 +39,13 @@ workflow SplitMergedBamByReadGroup {
     String workflow_name = "SplitMergedBamByReadGroup"
     String outdir = sub(gcs_out_root_dir, "/$", "") + "/~{workflow_name}/" + basename(input_bam, '.bam')
 
+    # most basic metadata and QC check
     call BU.GatherBamMetadata {
         input: bam = input_bam
     }
-
-    if (debug_mode) {
-        call HowManyReadGroupsAreInUse {input: bam = input_bam}
-    }
+    call Utils.InferSampleName { input: bam = input_bam, bai = input_bai }
+    call BU.ValidateSamFile { input: bam = input_bam }
+    # this guarantees that there are no records without RG tag
 
     # split
     String output_prefix = basename(input_bam, ".bam")
@@ -114,44 +114,10 @@ workflow SplitMergedBamByReadGroup {
 
     output {
         Map[String, String] rgid_2_bam = MapRgid2Bams.output_map
-        Map[String, Boolean]? rgid_2_ubam_emptyness = MapRgid2BamEmptiness.output_map
+        Map[String, String]? rgid_2_ubam_emptyness = MapRgid2BamEmptiness.output_map
         Boolean rgid_2_bam_are_aligned = ! unmap_bam
         Map[String, String]? rgid_2_fastq = MapRgid2Fqs.output_map
 
         String last_postprocessing_date = today.yyyy_mm_dd
-    }
-}
-
-task HowManyReadGroupsAreInUse {
-    meta {
-        desciption: "For debug purposes. Parse each record and collect counts of each read group."
-    }
-    input {
-        File bam
-    }
-
-    command <<<
-        set -eux
-
-        time \
-        samtools view -@3 ~{bam} | \
-            grep -Eo "RG:Z:[A-Za-z0-9_/-]+$(printf '\t')" \
-        > all_read_readgroup_ids.txt
-
-        time \
-        sort all_read_readgroup_ids.txt | \
-            uniq -c | \
-            awk '{print $2,$1}' | awk '{$1=$1};1' | tr -s ' ' '\t' | sed 's/RG:Z://' \
-        > readgroup_ids_and_counts.tsv
-    >>>
-
-    output {
-        Map[String, Int] rg_ids_freq = read_map("readgroup_ids_and_counts.tsv")
-    }
-
-    runtime {
-        cpu:    4
-        disks:  "local-disk 375 LOCAL"
-        docker: "us.gcr.io/broad-dsp-lrma/lr-basic:0.1.1"
     }
 }
